@@ -1,7 +1,10 @@
+import os
 import telebot
-import sqlite3
+import psycopg2
+from psycopg2.extras import DictCursor
 from telebot import types
 import time
+from datetime import datetime
 
 # Токен вашего бота
 API_TOKEN = '8311540508:AAGIhxpSt_YvF5DB7K5uW5gaZQHHoDj4d2k'
@@ -9,7 +12,253 @@ API_TOKEN = '8311540508:AAGIhxpSt_YvF5DB7K5uW5gaZQHHoDj4d2k'
 # Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
 
-# Функция для безопасного редактирования сообщений
+# ========== ПОДКЛЮЧЕНИЕ К POSTGRESQL ==========
+def get_db_connection():
+    """Получение соединения с PostgreSQL"""
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        # Если DATABASE_URL нет, используем SQLite для локальной разработки
+        import sqlite3
+        print("⚠️ DATABASE_URL не найден, используем SQLite для локальной разработки")
+        return sqlite3.connect('atomy_bot.db')
+    
+    # Подключаемся к PostgreSQL
+    conn = psycopg2.connect(database_url)
+    return conn
+
+def init_db():
+    """Инициализация таблиц в PostgreSQL"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Проверяем, используем ли мы PostgreSQL или SQLite
+    if isinstance(conn, psycopg2.extensions.connection):
+        # PostgreSQL синтаксис
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                referrer_id BIGINT,
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (referrer_id) REFERENCES users(user_id)
+            )
+        ''')
+    else:
+        # SQLite синтаксис
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                referrer_id INTEGER DEFAULT NULL,
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("✅ База данных инициализирована")
+
+# Инициализируем БД при запуске
+init_db()
+
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ ==========
+def is_bot_owner(user_id):
+    """Проверка, является ли пользователь владельцем бота"""
+    owner_info = get_bot_owner()
+    return owner_info['user_id'] == user_id
+
+def get_bot_owner():
+    """Получение информации о владельце бота"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if isinstance(conn, psycopg2.extensions.connection):
+        cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
+    else:
+        cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
+    
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if result:
+        user_id, username, full_name = result
+        if username:
+            return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
+        else:
+            return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
+    return {"user_id": None, "username": "@username_владельца", "full_name": "Владелец бота"}
+
+def add_user(user_id, username, full_name, referrer_id=None):
+    """Добавление или обновление пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            # PostgreSQL с UPSERT
+            cursor.execute('''
+                INSERT INTO users (user_id, username, full_name, referrer_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    username = EXCLUDED.username,
+                    full_name = EXCLUDED.full_name
+            ''', (user_id, username, full_name, referrer_id))
+        else:
+            # SQLite
+            cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+            existing_user = cursor.fetchone()
+            
+            if existing_user:
+                cursor.execute('''
+                    UPDATE users 
+                    SET username = ?, full_name = ?
+                    WHERE user_id = ?
+                ''', (username, full_name, user_id))
+            else:
+                cursor.execute('''
+                    INSERT INTO users (user_id, username, full_name, referrer_id)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, username, full_name, referrer_id))
+        
+        conn.commit()
+    except Exception as e:
+        print(f"Ошибка при добавлении пользователя: {e}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
+
+def get_referrer_info(referrer_id):
+    """Получение информации о реферере"""
+    if not referrer_id:
+        return get_bot_owner()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if isinstance(conn, psycopg2.extensions.connection):
+        cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = %s', (referrer_id,))
+    else:
+        cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = ?', (referrer_id,))
+    
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if result:
+        user_id, username, full_name = result
+        if username:
+            return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
+        else:
+            return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
+    return get_bot_owner()
+
+def get_ref_count(user_id):
+    """Получение количества рефералов пользователя"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if isinstance(conn, psycopg2.extensions.connection):
+        cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = %s', (user_id,))
+    else:
+        cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (user_id,))
+    
+    count = cursor.fetchone()[0]
+    cursor.close()
+    conn.close()
+    return count
+
+def get_all_users():
+    """Получение списка всех пользователей"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if isinstance(conn, psycopg2.extensions.connection):
+        cursor.execute('''
+            SELECT user_id, username, full_name, 
+                   (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
+                   join_date
+            FROM users 
+            ORDER BY join_date DESC
+        ''')
+    else:
+        cursor.execute('''
+            SELECT user_id, username, full_name, 
+                   (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
+                   join_date
+            FROM users 
+            ORDER BY join_date DESC
+        ''')
+    
+    users = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return users
+
+def delete_user(target_user_id):
+    """Удаление пользователя из реферальной системы"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Получаем информацию о пользователе
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT username, full_name FROM users WHERE user_id = %s', (target_user_id,))
+        else:
+            cursor.execute('SELECT username, full_name FROM users WHERE user_id = ?', (target_user_id,))
+        
+        user_data = cursor.fetchone()
+        
+        if not user_data:
+            return None, 0
+        
+        # Получаем владельца бота
+        owner_info = get_bot_owner()
+        
+        # Обновляем рефералов удаляемого пользователя
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('''
+                UPDATE users 
+                SET referrer_id = %s 
+                WHERE referrer_id = %s
+            ''', (owner_info['user_id'], target_user_id))
+        else:
+            cursor.execute('''
+                UPDATE users 
+                SET referrer_id = ? 
+                WHERE referrer_id = ?
+            ''', (owner_info['user_id'], target_user_id))
+        
+        updated_referrals = cursor.rowcount
+        
+        # Удаляем пользователя
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('DELETE FROM users WHERE user_id = %s', (target_user_id,))
+        else:
+            cursor.execute('DELETE FROM users WHERE user_id = ?', (target_user_id,))
+        
+        conn.commit()
+        
+        return {
+            'username': user_data[0],
+            'full_name': user_data[1],
+            'updated_referrals': updated_referrals
+        }, target_user_id
+        
+    except Exception as e:
+        print(f"Ошибка при удалении пользователя: {e}")
+        conn.rollback()
+        return None, 0
+    finally:
+        cursor.close()
+        conn.close()
+
+# ========== ФУНКЦИЯ БЕЗОПАСНОГО РЕДАКТИРОВАНИЯ ==========
 def safe_edit_message_text(call, new_text, new_markup, parse_mode="HTML"):
     """Безопасное редактирование сообщения с проверкой на изменения"""
     try:
@@ -29,92 +278,56 @@ def safe_edit_message_text(call, new_text, new_markup, parse_mode="HTML"):
         else:
             print(f"Ошибка: {e}")
 
-# ========== БАЗА ДАННЫХ ==========
-def init_db():
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            referrer_id INTEGER DEFAULT NULL,
-            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def is_bot_owner(user_id):
+# ========== КОМАНДА ДЛЯ УДАЛЕНИЯ ПОЛЬЗОВАТЕЛЯ ==========
+@bot.message_handler(commands=['deleteuser', 'удалить', 'remove'])
+def cmd_delete_user(message):
+    """Удаление пользователя из реферальной системы"""
+    user_id = message.from_user.id
+    
+    if not is_bot_owner(user_id):
+        bot.reply_to(message, "⛔ Эта команда доступна только владельцу бота!")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        bot.reply_to(message,
+                     "❓ <b>Использование:</b>\n"
+                     "<code>/deleteuser ID_пользователя</code>\n\n"
+                     "Пример: <code>/deleteuser 123456789</code>\n\n"
+                     "Чтобы получить список пользователей, используйте /users",
+                     parse_mode="HTML")
+        return
+    
+    try:
+        target_user_id = int(args[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Неверный ID пользователя!")
+        return
+    
     owner_info = get_bot_owner()
-    return owner_info['user_id'] == user_id
-
-def get_all_users():
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT user_id, username, full_name, 
-               (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
-               join_date
-        FROM users 
-        ORDER BY join_date DESC
-    ''')
-    users = cursor.fetchall()
-    conn.close()
-    return users
-
-def get_bot_owner():
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
-    result = cursor.fetchone()
-    conn.close()
+    if target_user_id == owner_info['user_id']:
+        bot.reply_to(message, "❌ Нельзя удалить владельца бота!")
+        return
     
-    if result:
-        user_id, username, full_name = result
-        if username:
-            return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
-        else:
-            return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
-    return {"user_id": None, "username": "@username_владельца", "full_name": "Владелец бота"}
-
-def get_referrer_info(referrer_id):
-    if not referrer_id:
-        return get_bot_owner()
+    result, deleted_id = delete_user(target_user_id)
     
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = ?', (referrer_id,))
-    result = cursor.fetchone()
-    conn.close()
+    if not result:
+        bot.reply_to(message, f"❌ Пользователь с ID {target_user_id} не найден!")
+        return
     
-    if result:
-        user_id, username, full_name = result
-        if username:
-            return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
-        else:
-            return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
-    return get_bot_owner()
+    response = f"""✅ <b>Пользователь успешно удален!</b>
 
-def add_user(user_id, username, full_name, referrer_id=None):
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, full_name, referrer_id)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, username, full_name, referrer_id))
-    conn.commit()
-    conn.close()
+👤 <b>Удаленный пользователь:</b>
+• Имя: {result['full_name']}
+• Username: @{result['username'] if result['username'] else 'отсутствует'}
+• ID: <code>{deleted_id}</code>
 
-def get_ref_count(user_id):
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (user_id,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count
+🔄 <b>Изменения в системе:</b>
+• {result['updated_referrals']} рефералов перепривязаны к владельцу бота
+
+<i>Теперь этот пользователь может заново зарегистрироваться через новую ссылку.</i>"""
+    
+    bot.send_message(message.chat.id, response, parse_mode="HTML")
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
@@ -1091,4 +1304,5 @@ if __name__ == '__main__':
             print(f"Ошибка подключения: {e}")
             time.sleep(5)
             continue
+
 
