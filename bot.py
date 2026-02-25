@@ -5,12 +5,38 @@ from psycopg2.extras import DictCursor
 from telebot import types
 import time
 from datetime import datetime
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Токен вашего бота
 API_TOKEN = '8311540508:AAGIhxpSt_YvF5DB7K5uW5gaZQHHoDj4d2k'
 
 # Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
+
+# ========== HTTP СЕРВЕР ДЛЯ HEALTHCHECK ==========
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    
+    def log_message(self, format, *args):
+        # Не логируем healthcheck запросы
+        pass
+
+def run_health_server():
+    try:
+        server = HTTPServer(('0.0.0.0', 8080), HealthCheckHandler)
+        print("✅ Healthcheck сервер запущен на порту 8080")
+        server.serve_forever()
+    except Exception as e:
+        print(f"⚠️ Healthcheck сервер не запущен: {e}")
+
+# Запускаем healthcheck сервер в отдельном потоке
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # ========== ПОДКЛЮЧЕНИЕ К POSTGRESQL ==========
 def get_db_connection():
@@ -20,7 +46,7 @@ def get_db_connection():
         # Если DATABASE_URL нет, используем SQLite для локальной разработки
         import sqlite3
         print("⚠️ DATABASE_URL не найден, используем SQLite для локальной разработки")
-        return sqlite3.connect('atomy_bot.db')
+        return sqlite3.connect('atomy_bot.db', check_same_thread=False)
     
     # Подключаемся к PostgreSQL
     conn = psycopg2.connect(database_url)
@@ -32,7 +58,18 @@ def init_db():
     cursor = conn.cursor()
     
     # Проверяем, используем ли мы PostgreSQL или SQLite
-    if isinstance(conn, psycopg2.extensions.connection):
+    if hasattr(conn, 'cursor') and not isinstance(conn, psycopg2.extensions.connection):
+        # SQLite синтаксис
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                referrer_id INTEGER,
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+    else:
         # PostgreSQL синтаксис
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -40,20 +77,13 @@ def init_db():
                 username TEXT,
                 full_name TEXT,
                 referrer_id BIGINT,
-                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (referrer_id) REFERENCES users(user_id)
-            )
-        ''')
-    else:
-        # SQLite синтаксис
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                referrer_id INTEGER DEFAULT NULL,
                 join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        ''')
+        
+        # Создаем индекс для быстрого поиска по referrer_id
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_referrer_id ON users(referrer_id)
         ''')
     
     conn.commit()
@@ -75,21 +105,26 @@ def get_bot_owner():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if isinstance(conn, psycopg2.extensions.connection):
-        cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
-    else:
-        cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
-    
-    result = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if result:
-        user_id, username, full_name = result
-        if username:
-            return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
         else:
-            return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
+            cursor.execute('SELECT user_id, username, full_name FROM users ORDER BY join_date ASC LIMIT 1')
+        
+        result = cursor.fetchone()
+        
+        if result:
+            user_id, username, full_name = result
+            if username:
+                return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
+            else:
+                return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
+    except Exception as e:
+        print(f"Ошибка при получении владельца: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+    
     return {"user_id": None, "username": "@username_владельца", "full_name": "Владелец бота"}
 
 def add_user(user_id, username, full_name, referrer_id=None):
@@ -110,20 +145,10 @@ def add_user(user_id, username, full_name, referrer_id=None):
             ''', (user_id, username, full_name, referrer_id))
         else:
             # SQLite
-            cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
-            existing_user = cursor.fetchone()
-            
-            if existing_user:
-                cursor.execute('''
-                    UPDATE users 
-                    SET username = ?, full_name = ?
-                    WHERE user_id = ?
-                ''', (username, full_name, user_id))
-            else:
-                cursor.execute('''
-                    INSERT INTO users (user_id, username, full_name, referrer_id)
-                    VALUES (?, ?, ?, ?)
-                ''', (user_id, username, full_name, referrer_id))
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (user_id, username, full_name, referrer_id)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, username, full_name, referrer_id))
         
         conn.commit()
     except Exception as e:
@@ -141,21 +166,26 @@ def get_referrer_info(referrer_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if isinstance(conn, psycopg2.extensions.connection):
-        cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = %s', (referrer_id,))
-    else:
-        cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = ?', (referrer_id,))
-    
-    result = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if result:
-        user_id, username, full_name = result
-        if username:
-            return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = %s', (referrer_id,))
         else:
-            return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
+            cursor.execute('SELECT user_id, username, full_name FROM users WHERE user_id = ?', (referrer_id,))
+        
+        result = cursor.fetchone()
+        
+        if result:
+            user_id, username, full_name = result
+            if username:
+                return {"user_id": user_id, "username": f"@{username}", "full_name": full_name}
+            else:
+                return {"user_id": user_id, "username": f"ID: {user_id}", "full_name": full_name}
+    except Exception as e:
+        print(f"Ошибка при получении информации о реферере: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+    
     return get_bot_owner()
 
 def get_ref_count(user_id):
@@ -163,42 +193,52 @@ def get_ref_count(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if isinstance(conn, psycopg2.extensions.connection):
-        cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = %s', (user_id,))
-    else:
-        cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (user_id,))
-    
-    count = cursor.fetchone()[0]
-    cursor.close()
-    conn.close()
-    return count
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = %s', (user_id,))
+        else:
+            cursor.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (user_id,))
+        
+        count = cursor.fetchone()[0]
+        return count
+    except Exception as e:
+        print(f"Ошибка при подсчете рефералов: {e}")
+        return 0
+    finally:
+        cursor.close()
+        conn.close()
 
 def get_all_users():
     """Получение списка всех пользователей"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if isinstance(conn, psycopg2.extensions.connection):
-        cursor.execute('''
-            SELECT user_id, username, full_name, 
-                   (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
-                   join_date
-            FROM users 
-            ORDER BY join_date DESC
-        ''')
-    else:
-        cursor.execute('''
-            SELECT user_id, username, full_name, 
-                   (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
-                   join_date
-            FROM users 
-            ORDER BY join_date DESC
-        ''')
-    
-    users = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return users
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('''
+                SELECT user_id, username, full_name, 
+                       (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
+                       join_date
+                FROM users 
+                ORDER BY join_date DESC
+            ''')
+        else:
+            cursor.execute('''
+                SELECT user_id, username, full_name, 
+                       (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id) as ref_count,
+                       join_date
+                FROM users 
+                ORDER BY join_date DESC
+            ''')
+        
+        users = cursor.fetchall()
+        return users
+    except Exception as e:
+        print(f"Ошибка при получении списка пользователей: {e}")
+        return []
+    finally:
+        cursor.close()
+        conn.close()
 
 def delete_user(target_user_id):
     """Удаление пользователя из реферальной системы"""
@@ -278,57 +318,6 @@ def safe_edit_message_text(call, new_text, new_markup, parse_mode="HTML"):
         else:
             print(f"Ошибка: {e}")
 
-# ========== КОМАНДА ДЛЯ УДАЛЕНИЯ ПОЛЬЗОВАТЕЛЯ ==========
-@bot.message_handler(commands=['deleteuser', 'удалить', 'remove'])
-def cmd_delete_user(message):
-    """Удаление пользователя из реферальной системы"""
-    user_id = message.from_user.id
-    
-    if not is_bot_owner(user_id):
-        bot.reply_to(message, "⛔ Эта команда доступна только владельцу бота!")
-        return
-    
-    args = message.text.split()
-    if len(args) != 2:
-        bot.reply_to(message,
-                     "❓ <b>Использование:</b>\n"
-                     "<code>/deleteuser ID_пользователя</code>\n\n"
-                     "Пример: <code>/deleteuser 123456789</code>\n\n"
-                     "Чтобы получить список пользователей, используйте /users",
-                     parse_mode="HTML")
-        return
-    
-    try:
-        target_user_id = int(args[1])
-    except ValueError:
-        bot.reply_to(message, "❌ Неверный ID пользователя!")
-        return
-    
-    owner_info = get_bot_owner()
-    if target_user_id == owner_info['user_id']:
-        bot.reply_to(message, "❌ Нельзя удалить владельца бота!")
-        return
-    
-    result, deleted_id = delete_user(target_user_id)
-    
-    if not result:
-        bot.reply_to(message, f"❌ Пользователь с ID {target_user_id} не найден!")
-        return
-    
-    response = f"""✅ <b>Пользователь успешно удален!</b>
-
-👤 <b>Удаленный пользователь:</b>
-• Имя: {result['full_name']}
-• Username: @{result['username'] if result['username'] else 'отсутствует'}
-• ID: <code>{deleted_id}</code>
-
-🔄 <b>Изменения в системе:</b>
-• {result['updated_referrals']} рефералов перепривязаны к владельцу бота
-
-<i>Теперь этот пользователь может заново зарегистрироваться через новую ссылку.</i>"""
-    
-    bot.send_message(message.chat.id, response, parse_mode="HTML")
-
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -391,8 +380,8 @@ def cmd_start(message):
             bot.send_message(referrer_id, notification_text)
             ref_count = get_ref_count(referrer_id)
             bot.send_message(referrer_id, f"📊 Всего по вашим ссылкам зарегистрировано: {ref_count} человек(а)")
-        except:
-            pass
+        except Exception as e:
+            print(f"Ошибка при отправке уведомления: {e}")
 
 # ========== РАЗДЕЛ "О КОМПАНИИ ATOMY" ==========
 @bot.message_handler(func=lambda message: message.text == "Расскажи мне о компании Atomy")
@@ -508,13 +497,24 @@ https://vkvideo.ru/video562800842_456239021
 @bot.callback_query_handler(func=lambda call: call.data == "become_partner")
 def become_partner_callback(call):
     user_id = call.from_user.id
+    referrer_id = None
     
-    conn = sqlite3.connect('atomy_bot.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    referrer_id = result[0] if result else None
-    conn.close()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
+        
+        result = cursor.fetchone()
+        referrer_id = result[0] if result else None
+    except Exception as e:
+        print(f"Ошибка при получении referrer_id: {e}")
+    finally:
+        cursor.close()
+        conn.close()
     
     contact_info = get_referrer_info(referrer_id) if referrer_id else get_bot_owner()
     
@@ -958,11 +958,22 @@ def cmd_generate(message):
         bot.reply_to(message, "❌ Неверный ID пользователя!")
         return
     
-    conn = sqlite3.connect('atomy_bot.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT username, full_name FROM users WHERE user_id = ?', (target_user_id,))
-    user_data = cursor.fetchone()
-    conn.close()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT username, full_name FROM users WHERE user_id = %s', (target_user_id,))
+        else:
+            cursor.execute('SELECT username, full_name FROM users WHERE user_id = ?', (target_user_id,))
+        
+        user_data = cursor.fetchone()
+    except Exception as e:
+        print(f"Ошибка при получении данных пользователя: {e}")
+        user_data = None
+    finally:
+        cursor.close()
+        conn.close()
     
     if not user_data:
         bot.reply_to(message, f"❌ Пользователь с ID {target_user_id} не найден!")
@@ -1051,12 +1062,23 @@ https://kr.atomy.com/category?dispCtgNo=2412002654&sortType=POPULAR
 Сертификаты: https://ch.atomy.com/ru/categories/58"""
 
     user_id = call.from_user.id
-    conn = sqlite3.connect('atomy_bot.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    referrer_id = result[0] if result else None
-    conn.close()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
+        
+        result = cursor.fetchone()
+        referrer_id = result[0] if result else None
+    except Exception as e:
+        print(f"Ошибка при получении referrer_id: {e}")
+        referrer_id = None
+    finally:
+        cursor.close()
+        conn.close()
     
     contact_info = get_referrer_info(referrer_id) if referrer_id else get_bot_owner()
     
@@ -1086,12 +1108,23 @@ https://kr.atomy.com/category?dispCtgNo=2412002657&sortType=POPULAR
 Сертификаты: https://ch.atomy.com/ru/categories/59"""
 
     user_id = call.from_user.id
-    conn = sqlite3.connect('atomy_bot.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    referrer_id = result[0] if result else None
-    conn.close()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
+        
+        result = cursor.fetchone()
+        referrer_id = result[0] if result else None
+    except Exception as e:
+        print(f"Ошибка при получении referrer_id: {e}")
+        referrer_id = None
+    finally:
+        cursor.close()
+        conn.close()
     
     contact_info = get_referrer_info(referrer_id) if referrer_id else get_bot_owner()
     
@@ -1131,12 +1164,23 @@ https://kr.atomy.com/category?dispCtgNo=2412002678&sortType=POPULAR
 https://frata.myluuk.app/widget/v2/index.html?vendor=atomy"""
 
     user_id = call.from_user.id
-    conn = sqlite3.connect('atomy_bot.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    referrer_id = result[0] if result else None
-    conn.close()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
+        
+        result = cursor.fetchone()
+        referrer_id = result[0] if result else None
+    except Exception as e:
+        print(f"Ошибка при получении referrer_id: {e}")
+        referrer_id = None
+    finally:
+        cursor.close()
+        conn.close()
     
     contact_info = get_referrer_info(referrer_id) if referrer_id else get_bot_owner()
     
@@ -1167,12 +1211,23 @@ def oral_care_callback(call):
 https://www.atomy.ru/category?dispCtgNo=2504003408&sortType=POPULAR"""
 
     user_id = call.from_user.id
-    conn = sqlite3.connect('atomy_bot.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    referrer_id = result[0] if result else None
-    conn.close()
+    
+    try:
+        if isinstance(conn, psycopg2.extensions.connection):
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (user_id,))
+        
+        result = cursor.fetchone()
+        referrer_id = result[0] if result else None
+    except Exception as e:
+        print(f"Ошибка при получении referrer_id: {e}")
+        referrer_id = None
+    finally:
+        cursor.close()
+        conn.close()
     
     contact_info = get_referrer_info(referrer_id) if referrer_id else get_bot_owner()
     
@@ -1260,19 +1315,16 @@ def echo_all(message):
                             "Расскажи мне о бизнесе Atomy",
                             "О продукции компании",
                             "О системе продвижения в бизнесе"]:
-        bot.reply_to(message, "Я вас не понял. Используйте кнопки меню или команды: /start, /myref, /stats")
+        bot.reply_to(message, "Я вас не понял. Используйте кнопки меню или команды: /start, /stats")
 
 @bot.message_handler(commands=['setowner', 'установитьвладельца'])
 def cmd_setowner(message):
     user_id = message.from_user.id
     
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM users')
-    count = cursor.fetchone()[0]
-    conn.close()
+    # Проверяем, есть ли уже пользователи
+    users = get_all_users()
     
-    if count > 0:
+    if users and len(users) > 0:
         current_owner = get_bot_owner()
         if user_id != current_owner['user_id']:
             bot.reply_to(message, "⛔ Изменить владельца может только текущий владелец!")
@@ -1283,29 +1335,52 @@ def cmd_setowner(message):
     if message.from_user.last_name:
         full_name += " " + message.from_user.last_name
     
-    conn = sqlite3.connect('atomy_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO users (user_id, username, full_name)
-        VALUES (?, ?, ?)
-    ''', (user_id, username, full_name))
-    conn.commit()
-    conn.close()
+    add_user(user_id, username, full_name, None)
     
     bot.reply_to(message, f"✅ Вы теперь владелец бота!\nВаш ID: <code>{user_id}</code>", parse_mode="HTML")
 
-# ========== ЗАПУСК ==========
+# ========== ЗАПУСК БОТА ==========
 if __name__ == '__main__':
-    print("Бот Atomy запущен с PostgreSQL...")
-    print(f"Подключение к БД: {'PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite'}")
+    print("=" * 50)
+    print("🚀 Бот Atomy запускается...")
+    print("=" * 50)
     
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=0, timeout=30)
-        except Exception as e:
-            print(f"Ошибка подключения: {e}")
-            time.sleep(5)
-            continue
+    # Проверяем подключение к БД
+    db_type = 'PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite'
+    print(f"📊 Тип базы данных: {db_type}")
+    
+    # Проверяем токен
+    if API_TOKEN == '8311540508:AAGIhxpSt_YvF5DB7K5uW5gaZQHHoDj4d2k':
+        print("⚠️ ВНИМАНИЕ: Используется токен по умолчанию!")
+    else:
+        print("✅ Токен бота загружен")
+    
+    # Удаляем вебхук (важно!)
+    try:
+        bot.remove_webhook()
+        print("✅ Вебхук удален")
+    except Exception as e:
+        print(f"⚠️ Ошибка при удалении вебхука: {e}")
+    
+    # Небольшая пауза для стабильности
+    time.sleep(1)
+    
+    print("🔄 Бот начинает polling...")
+    print("=" * 50)
+    
+    # Запускаем бота
+    try:
+        # Используем infinity_polling с правильными параметрами
+        bot.infinity_polling(
+            timeout=30,              # Таймаут для long polling
+            long_polling_timeout=20,  # Таймаут для long polling соединения
+            skip_pending=True         # Пропускаем старые сообщения
+        )
+    except Exception as e:
+        print(f"❌ Критическая ошибка при запуске бота: {e}")
+        import traceback
+        traceback.print_exc()
+        time.sleep(5)
 
 
 
