@@ -922,13 +922,36 @@ def cmd_users(message):
         return
     
     users_text = "👥 <b>Список пользователей:</b>\n\n"
-    for i, (uid, username, full_name, ref_count, join_date) in enumerate(users[:50], 1):
+    for i, user_data in enumerate(users[:50], 1):
+        # Распаковываем данные
+        uid, username, full_name, ref_count, join_date = user_data
+        
         user_ref = f"ID: <code>{uid}</code>"
         if username:
             user_ref = f"@{username}"
+        
         users_text += f"{i}. {full_name} ({user_ref})\n"
         users_text += f"   📊 Рефералов: {ref_count}\n"
-        users_text += f"   📅 Дата: {str(join_date)[:10]}\n\n"
+        
+        # ИСПРАВЛЕНО: безопасное преобразование даты
+        if join_date:
+            try:
+                # Если это объект datetime, используем strftime
+                if hasattr(join_date, 'strftime'):
+                    date_str = join_date.strftime('%Y-%m-%d')
+                else:
+                    # Если это строка, обрезаем
+                    date_str = str(join_date)[:10]
+                users_text += f"   📅 Дата: {date_str}\n\n"
+            except:
+                users_text += f"   📅 Дата: ошибка формата\n\n"
+        else:
+            users_text += f"   📅 Дата: неизвестно\n\n"
+    
+    if len(users) > 50:
+        users_text += f"\n... и еще {len(users) - 50} пользователей"
+    
+    bot.send_message(message.chat.id, users_text, parse_mode="HTML")
     
     if len(users) > 50:
         users_text += f"\n... и еще {len(users) - 50} пользователей"
@@ -1381,6 +1404,7 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
         time.sleep(5)
+
 
 
 
