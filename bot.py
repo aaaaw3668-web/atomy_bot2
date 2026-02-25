@@ -928,7 +928,7 @@ def cmd_users(message):
             user_ref = f"@{username}"
         users_text += f"{i}. {full_name} ({user_ref})\n"
         users_text += f"   📊 Рефералов: {ref_count}\n"
-        users_text += f"   📅 Дата: {join_date[:10]}\n\n"
+        users_text += f"   📅 Дата: {str(join_date)[:10]}\n\n"
     
     if len(users) > 50:
         users_text += f"\n... и еще {len(users) - 50} пользователей"
@@ -1381,6 +1381,7 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
         time.sleep(5)
+
 
 
 
