@@ -1296,7 +1296,9 @@ def cmd_setowner(message):
 
 # ========== ЗАПУСК ==========
 if __name__ == '__main__':
-    print("Бот Atomy запущен...")
+    print("Бот Atomy запущен с PostgreSQL...")
+    print(f"Подключение к БД: {'PostgreSQL' if os.environ.get('DATABASE_URL') else 'SQLite'}")
+    
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=30)
@@ -1304,5 +1306,6 @@ if __name__ == '__main__':
             print(f"Ошибка подключения: {e}")
             time.sleep(5)
             continue
+
 
 
